@@ -19,9 +19,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: clover-owner-data-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   seed:
