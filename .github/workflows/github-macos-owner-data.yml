@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   seed:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 180
     steps:
       - name: Check out UniXNU/UniXNU
