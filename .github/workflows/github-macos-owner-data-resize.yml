@@ -1,0 +1,218 @@
+# Lives in doufujun/UniXNU-clover fork only — do NOT PR to upstream.
+# r198: grow the existing 32MiB CI seed to 1GiB WITHOUT changing volume UUID.
+# Do NOT re-run prepare-owner-data-fixture.py (that would mint a new UUID).
+
+name: clover-owner-data-resize-1g
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Actions run that produced clover-owner-data-seed (32MiB)
+        required: true
+        default: "42116169608"
+      want_uuid:
+        description: Volume UUID that must stay unchanged
+        required: true
+        default: "BDFB0D68-CA27-4BCE-AB51-1759019D46CB"
+      want_bytes:
+        description: Target APFS container size in bytes (1GiB)
+        required: true
+        default: "1073741824"
+      expect_src_sha256:
+        description: sha256 of the 32MiB owner-data-32.cdr
+        required: true
+        default: "75ac47931c31221864d23b7d30dda8ed56ef73cb550556c1e163164235d876e2"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: clover-owner-data-resize-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resize:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Download 32MiB seed artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clover-owner-data-seed
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: seed-in
+
+      - name: Pad image and diskutil apfs resizeContainer
+        env:
+          WANT_UUID: ${{ inputs.want_uuid }}
+          WANT_BYTES: ${{ inputs.want_bytes }}
+          EXPECT_SRC_SHA256: ${{ inputs.expect_src_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib, json, os, pathlib, plistlib, subprocess, sys, time
+
+          want_uuid = os.environ["WANT_UUID"].strip().upper()
+          want_bytes = int(os.environ["WANT_BYTES"])
+          expect_src = os.environ["EXPECT_SRC_SHA256"].strip().lower()
+          src_dir = pathlib.Path("seed-in")
+          cdrs = list(src_dir.rglob("owner-data-32.cdr"))
+          if not cdrs:
+              print("downloaded tree:", flush=True)
+              for p in src_dir.rglob("*"):
+                  print(" ", p, p.stat().st_size if p.is_file() else "", flush=True)
+              sys.exit("owner-data-32.cdr not found in artifact")
+          src = cdrs[0]
+          seed_json_path = src.parent / "seed.json"
+          data = src.read_bytes()
+          src_sha = hashlib.sha256(data).hexdigest()
+          print(f"src={src} bytes={len(data)} sha256={src_sha}", flush=True)
+          if len(data) != 32 * 1024 * 1024:
+              sys.exit(f"source seed is {len(data)} bytes, expected 33554432")
+          if src_sha != expect_src:
+              sys.exit(f"source sha256 {src_sha} != {expect_src}")
+          if data[32:36] != b"NXSB":
+              sys.exit("source NXSB magic missing at offset 0x20")
+          block_size = int.from_bytes(data[36:40], "little")
+          block_count = int.from_bytes(data[40:48], "little")
+          print(f"src NXSB block_size={block_size} block_count={block_count}", flush=True)
+          if block_size != 4096 or block_count != 8192:
+              sys.exit(f"unexpected NXSB geometry {block_size} x {block_count}")
+
+          out_dir = pathlib.Path("owner-data-out")
+          out_dir.mkdir(exist_ok=True)
+          dst = out_dir / "owner-data-1g.cdr"
+          dst.write_bytes(data)
+          with dst.open("r+b") as f:
+              f.truncate(want_bytes)
+          print(f"padded {dst} to {dst.stat().st_size}", flush=True)
+
+          def run(cmd, **kw):
+              print("+", " ".join(cmd), flush=True)
+              return subprocess.run(cmd, check=True, **kw)
+
+          attach_plist = pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "attach.plist"
+          run([
+              "hdiutil", "attach", "-nomount", "-noverify", "-nobrowse",
+              "-imagekey", "diskimage-class=CRawDiskImage",
+              "-plist", str(dst),
+          ], stdout=attach_plist.open("wb"))
+          attach = plistlib.loads(attach_plist.read_bytes())
+          print("attach entities:", flush=True)
+          for ent in attach.get("system-entities", []):
+              print(" ", ent.get("dev-entry"), ent.get("content-hint"), flush=True)
+
+          def apfs_list():
+              raw = subprocess.check_output(["diskutil", "apfs", "list", "-plist"])
+              return plistlib.loads(raw)
+
+          def find_target():
+              listing = apfs_list()
+              matches = []
+              for c in listing.get("Containers", []):
+                  for v in c.get("Volumes", []):
+                      vu = str(v.get("VolumeUUID", "")).upper()
+                      if vu == want_uuid:
+                          matches.append((c, v))
+              if not matches:
+                  print(json.dumps(listing, default=str)[:4000], flush=True)
+                  sys.exit(f"attached image does not contain volume UUID {want_uuid}")
+              if len(matches) != 1:
+                  sys.exit(f"UUID {want_uuid} matched {len(matches)} volumes")
+              return matches[0]
+
+          container, volume = find_target()
+          cref = container["ContainerReference"]
+          vref = volume["DeviceIdentifier"]
+          print(
+              f"before resize container={cref} volume={vref} "
+              f"uuid={volume.get('VolumeUUID')} cap={container.get('CapacityCeiling')}",
+              flush=True,
+          )
+          run(["diskutil", "apfs", "resizeContainer", cref, "0"])
+          time.sleep(1)
+          container, volume = find_target()
+          after_uuid = str(volume.get("VolumeUUID", "")).upper()
+          print(
+              f"after resize container={container['ContainerReference']} "
+              f"volume={volume['DeviceIdentifier']} uuid={after_uuid} "
+              f"cap={container.get('CapacityCeiling')}",
+              flush=True,
+          )
+          if after_uuid != want_uuid:
+              sys.exit(f"UUID changed {want_uuid} -> {after_uuid}")
+
+          # Detach every disk that hdiutil attached (whole image).
+          detached = set()
+          for ent in attach.get("system-entities", []):
+              dev = ent.get("dev-entry")
+              if not dev:
+                  continue
+              import re
+              m = re.match(r"(/dev/disk\d+)", dev)
+              base = m.group(1) if m else dev
+              if base in detached:
+                  continue
+              try:
+                  run(["hdiutil", "detach", base])
+                  detached.add(base)
+              except subprocess.CalledProcessError:
+                  print(f"detach {base} failed, trying next", flush=True)
+          if not detached:
+              sys.exit("failed to detach any attached disk")
+
+          out = dst.read_bytes()
+          if len(out) != want_bytes:
+              sys.exit(f"output size {len(out)} != {want_bytes}")
+          if out[32:36] != b"NXSB":
+              sys.exit("output NXSB magic missing")
+          out_bs = int.from_bytes(out[36:40], "little")
+          out_bc = int.from_bytes(out[40:48], "little")
+          print(f"out NXSB block_size={out_bs} block_count={out_bc}", flush=True)
+          if out_bs != 4096:
+              sys.exit(f"output block_size {out_bs} != 4096")
+          if out_bc != want_bytes // 4096:
+              sys.exit(f"output block_count {out_bc} != {want_bytes // 4096}")
+          out_sha = hashlib.sha256(out).hexdigest()
+          seed_json = {}
+          if seed_json_path.is_file():
+              seed_json = json.loads(seed_json_path.read_text())
+          old_uuid = str(seed_json.get("volume_uuid", want_uuid)).upper()
+          if old_uuid != want_uuid:
+              sys.exit(f"input seed.json UUID {old_uuid} != {want_uuid}")
+          seed_json["volume_uuid"] = want_uuid
+          seed_json["bytes"] = want_bytes
+          seed_json["sha256"] = out_sha
+          seed_json["resized_from_sha256"] = src_sha
+          seed_json["resized_from_bytes"] = len(data)
+          (out_dir / "seed.json").write_text(json.dumps(seed_json, indent=2) + "\n")
+          report = {
+              "bytes": want_bytes,
+              "sha256": out_sha,
+              "nxsb_ok": True,
+              "nxsb_block_size": out_bs,
+              "nxsb_block_count": out_bc,
+              "volume_uuid": want_uuid,
+              "uuid_unchanged": True,
+              "source_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "source_seed_sha256": src_sha,
+              "source_seed_bytes": len(data),
+              "seed_json": seed_json,
+          }
+          (out_dir / "ci-report.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, indent=2), flush=True)
+          PY
+
+      - name: Upload 1GiB seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: clover-owner-data-1g
+          path: |
+            owner-data-out/owner-data-1g.cdr
+            owner-data-out/seed.json
+            owner-data-out/ci-report.json
+          if-no-files-found: error
+          retention-days: 14
