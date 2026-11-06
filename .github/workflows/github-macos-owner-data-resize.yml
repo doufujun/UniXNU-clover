@@ -114,7 +114,7 @@ jobs:
               matches = []
               for c in listing.get("Containers", []):
                   for v in c.get("Volumes", []):
-                      vu = str(v.get("VolumeUUID", "")).upper()
+                      vu = str(v.get("VolumeUUID") or v.get("APFSVolumeUUID") or "").upper()
                       if vu == want_uuid:
                           matches.append((c, v))
               if not matches:
@@ -129,13 +129,13 @@ jobs:
           vref = volume["DeviceIdentifier"]
           print(
               f"before resize container={cref} volume={vref} "
-              f"uuid={volume.get('VolumeUUID')} cap={container.get('CapacityCeiling')}",
+              f"uuid={volume.get('VolumeUUID') or volume.get('APFSVolumeUUID')} cap={container.get('CapacityCeiling')}",
               flush=True,
           )
           run(["diskutil", "apfs", "resizeContainer", cref, "0"])
           time.sleep(1)
           container, volume = find_target()
-          after_uuid = str(volume.get("VolumeUUID", "")).upper()
+          after_uuid = str(volume.get("VolumeUUID") or volume.get("APFSVolumeUUID") or "").upper()
           print(
               f"after resize container={container['ContainerReference']} "
               f"volume={volume['DeviceIdentifier']} uuid={after_uuid} "
